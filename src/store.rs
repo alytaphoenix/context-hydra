@@ -19,6 +19,12 @@ pub struct MatrixRow {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Nonce issued on checkout; must be presented to checkin. None when not checked out.
+    #[serde(default)]
+    pub checkout_nonce: Option<String>,
+    /// SHA-256 hex of the content body — used for dedup on offload.
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 pub struct Store {
@@ -42,6 +48,23 @@ impl Store {
             db: Arc::new(db),
             bodies_dir,
         })
+    }
+
+    /// On startup: reset any hot entries left over from a previous session.
+    /// Stale hot state and orphaned nonces from prior sessions are cleared.
+    pub fn startup_cleanup(&self) -> Result<u32> {
+        let rows = self.all()?;
+        let mut count = 0u32;
+        for mut row in rows {
+            if row.status == "hot" || row.checkout_nonce.is_some() {
+                row.status = "cold".to_string();
+                row.checkout_nonce = None;
+                row.updated_at = Utc::now();
+                self.insert(&row)?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn insert(&self, row: &MatrixRow) -> Result<()> {
@@ -83,6 +106,15 @@ impl Store {
         };
         write_txn.commit()?;
         Ok(removed)
+    }
+
+    /// Linear scan for a content hash — dedup check on offload.
+    pub fn find_by_hash(&self, hash: &str) -> Result<Option<MatrixRow>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
+        let rows = self.all()?;
+        Ok(rows.into_iter().find(|r| r.content_hash == hash))
     }
 
     pub fn body_path(&self, id: &str) -> PathBuf {
