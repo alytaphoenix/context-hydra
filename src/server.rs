@@ -144,6 +144,14 @@ fn default_salience() -> f64 {
     0.5
 }
 
+fn default_split_at() -> u8 {
+    2
+}
+
+fn default_summary_len() -> usize {
+    200
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
     #[serde(default)]
@@ -166,6 +174,26 @@ pub struct CheckinParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct OffloadPathSectionedParams {
+    /// Absolute path to the markdown file. Server reads it — content never enters context.
+    pub path: String,
+    pub ctx_type: String,
+    /// Split at headings of this level and above. 1=H1 only, 2=H1+H2 (default), 3=H1–H3.
+    #[serde(default = "default_split_at")]
+    pub split_at: u8,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_salience")]
+    pub salience: f64,
+    /// Pin all created entries immediately (sets salience 1.0, survives reap).
+    #[serde(default)]
+    pub pin: bool,
+    /// Max chars from section body to use as auto-summary. Default 200.
+    #[serde(default = "default_summary_len")]
+    pub summary_len: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReapParams {
     /// Delete entries older than this many days (based on created_at).
     pub max_age_days: Option<u32>,
@@ -178,6 +206,67 @@ pub struct ReapParams {
     pub dry_run: bool,
 }
 
+// ---------- markdown splitter ----------
+
+/// Returns `(heading_line, body)` pairs. `heading_line` is the full `## Foo` line
+/// (empty string for any preamble before the first heading). `body` contains all
+/// lines between headings, NOT including the heading line itself.
+/// Tracks ATX code fences (``` / ~~~) so headings inside fenced blocks are skipped.
+fn split_markdown_sections(content: &str, split_at: u8) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current_heading: String = String::new();
+    let mut current_body: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut has_any_section = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if is_fence {
+            in_fence = !in_fence;
+        }
+
+        // Only split on headings outside of fenced blocks and not on fence lines themselves.
+        if !is_fence && !in_fence {
+            if let Some(level) = markdown_heading_level(line) {
+                if level <= split_at as usize {
+                    // Save the section accumulated so far (including any preamble).
+                    if has_any_section || !current_body.is_empty() {
+                        sections.push((current_heading.clone(), current_body.join("\n")));
+                    }
+                    current_heading = line.to_string();
+                    current_body = Vec::new();
+                    has_any_section = true;
+                    continue;
+                }
+            }
+        }
+
+        current_body.push(line);
+    }
+
+    // Flush the final section.
+    if has_any_section || !current_body.is_empty() {
+        sections.push((current_heading, current_body.join("\n")));
+    }
+
+    sections
+}
+
+fn markdown_heading_level(line: &str) -> Option<usize> {
+    if !line.starts_with('#') {
+        return None;
+    }
+    let level = line.chars().take_while(|&c| c == '#').count();
+    let rest = &line[level..];
+    // Valid ATX heading: zero or more spaces follow the # run (empty heading is allowed).
+    if rest.is_empty() || rest.starts_with(' ') {
+        Some(level)
+    } else {
+        None
+    }
+}
+
 // ---------- tools ----------
 
 #[tool_router]
@@ -186,10 +275,12 @@ impl HydraServer {
     #[tool]
     async fn offload(&self, Parameters(p): Parameters<OffloadParams>) -> Result<String, String> {
         let bytes = p.content.len() as u64;
-        self.do_offload(
-            p.content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, bytes,
-        )
-        .await
+        let (_, msg) = self
+            .do_offload(
+                p.content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, false, bytes,
+            )
+            .await?;
+        Ok(msg)
     }
 
     /// Offload a file by path — server reads it, content never enters context. Strongest displacement.
@@ -203,10 +294,102 @@ impl HydraServer {
             .await
             .map_err(|e| format!("cannot read {}: {e}", p.path))?;
         let bytes = content.len() as u64;
-        self.do_offload(
-            content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, true, bytes,
-        )
-        .await
+        let (_, msg) = self
+            .do_offload(
+                content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, true, bytes,
+            )
+            .await?;
+        Ok(msg)
+    }
+
+    /// Offload a markdown file split by headings — each section becomes a separate entry.
+    /// Server reads the file; content never enters context. Code fences are tracked so
+    /// headings inside fenced blocks are not treated as split points. Sections with fewer
+    /// than 20 non-whitespace chars of body are skipped. The filename is auto-added as a
+    /// tag for easy retrieval via search. On re-runs, changed sections accumulate new
+    /// entries; use search(query: filename) then forget to clear stale ones first.
+    #[tool]
+    async fn offload_path_sectioned(
+        &self,
+        Parameters(p): Parameters<OffloadPathSectionedParams>,
+    ) -> Result<String, String> {
+        let path = std::path::PathBuf::from(&p.path);
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("cannot read {}: {e}", p.path))?;
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let sections = split_markdown_sections(&content, p.split_at);
+
+        let mut results: Vec<String> = Vec::new();
+        let mut skipped = 0usize;
+
+        for (heading_line, body) in sections {
+            let non_ws = body.chars().filter(|c| !c.is_whitespace()).count();
+            if non_ws < 20 {
+                skipped += 1;
+                continue;
+            }
+
+            let topic = if heading_line.is_empty() {
+                format!("{filename} (preamble)")
+            } else {
+                heading_line.trim_start_matches('#').trim().to_string()
+            };
+
+            let summary: String = body
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(p.summary_len)
+                .collect();
+
+            let mut tags = p.tags.clone();
+            if !tags.contains(&filename) {
+                tags.push(filename.clone());
+            }
+
+            let full_content = if heading_line.is_empty() {
+                body.clone()
+            } else {
+                format!("{heading_line}\n{body}")
+            };
+            let bytes = full_content.len() as u64;
+
+            let (_, msg) = self
+                .do_offload(
+                    full_content,
+                    p.ctx_type.clone(),
+                    topic,
+                    summary,
+                    tags,
+                    p.salience,
+                    p.pin,
+                    true,
+                    bytes,
+                )
+                .await?;
+            results.push(msg);
+        }
+
+        if results.is_empty() {
+            return Ok(format!(
+                "no sections with substantial content (skipped {skipped})"
+            ));
+        }
+
+        Ok(format!(
+            "offloaded {} sections from {} ({skipped} skipped)\n{}",
+            results.len(),
+            filename,
+            results.join("\n")
+        ))
     }
 
     /// Search the matrix by keyword, type, status, or salience. Returns compact rows.
@@ -562,9 +745,10 @@ impl HydraServer {
         summary: String,
         tags: Vec<String>,
         salience: f64,
+        pin: bool,
         by_ref: bool,
         bytes: u64,
-    ) -> Result<String, String> {
+    ) -> Result<(String, String), String> {
         let hash = content_hash(&content);
 
         let store2 = self.store.clone();
@@ -573,13 +757,29 @@ impl HydraServer {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-        if let Some(existing_row) = existing {
+        if let Some(mut existing_row) = existing {
+            // If pin requested and entry is not already pinned, pin it now.
+            if pin && existing_row.status != "pinned" {
+                existing_row.status = "pinned".to_string();
+                existing_row.salience = 1.0;
+                existing_row.updated_at = Utc::now();
+                let store2 = self.store.clone();
+                let row_c = existing_row.clone();
+                tokio::task::spawn_blocking(move || store2.insert(&row_c))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+            }
             self.stats.lock().unwrap().dedup_hits += 1;
-            return Ok(format!(
-                "duplicate: content already banked\n{}",
-                fmt_row(&existing_row)
-            ));
+            let id = existing_row.id.clone();
+            return Ok((id, format!("duplicate: content already banked\n{}", fmt_row(&existing_row))));
         }
+
+        let (status, final_salience) = if pin {
+            ("pinned".to_string(), 1.0f64)
+        } else {
+            ("cold".to_string(), salience)
+        };
 
         let id = uuid::Uuid::new_v4().to_string();
         let row = MatrixRow {
@@ -589,8 +789,8 @@ impl HydraServer {
             topic,
             tags,
             summary,
-            salience,
-            status: "cold".to_string(),
+            salience: final_salience,
+            status,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             checkout_nonce: None,
@@ -620,7 +820,7 @@ impl HydraServer {
             }
         }
 
-        Ok(format!("offloaded\n{}", fmt_row(&row)))
+        Ok((id, format!("offloaded\n{}", fmt_row(&row))))
     }
 
     async fn read_matrix_resource(&self) -> ResourceContents {
