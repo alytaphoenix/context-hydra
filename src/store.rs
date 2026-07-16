@@ -5,6 +5,44 @@ use chrono::{DateTime, Utc};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+// ---------- local model config ----------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalModelConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_compress_target")]
+    pub compress_target_tokens: u32,
+    #[serde(default = "default_checkout_remote_target")]
+    pub checkout_remote_target_tokens: u32,
+}
+
+fn default_compress_target() -> u32 { 200 }
+fn default_checkout_remote_target() -> u32 { 300 }
+
+#[derive(Debug, Deserialize)]
+struct RootConfig {
+    local_model: Option<LocalModelConfig>,
+}
+
+/// Read `~/.local/share/context-hydra/config.toml` (platform-appropriate data dir).
+/// Returns None if the file is absent, unparseable, or `base_url` is empty.
+pub fn load_local_model_config() -> Option<LocalModelConfig> {
+    let path = dirs::data_dir()?
+        .join("context-hydra")
+        .join("config.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    match toml::from_str::<RootConfig>(&text) {
+        Ok(root) => root.local_model.filter(|c| !c.base_url.is_empty()),
+        Err(e) => {
+            eprintln!("context-hydra: config.toml parse error: {e}");
+            None
+        }
+    }
+}
+
 pub const MATRIX: TableDefinition<&str, &[u8]> = TableDefinition::new("matrix");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,8 +35,9 @@ Agents interact via MCP tools. The matrix is always cheap to read; full bodies a
 | `recall` | Read one entry's summary without pulling the full body. No state change. |
 | `checkout` | Pull full body into context. Issues a nonce; marks entry hot. Body is fenced as untrusted. Warns on recent re-checkout (churn signal). |
 | `checkin` | Return a checked-out entry. Requires the nonce from `checkout`. Marks entry cold. |
-| `offload` | Move content out of active context. Deduplicates by content hash. Returns a matrix pointer. |
+| `offload` | Move content out of active context. Deduplicates by content hash. Pass `compress: true` to run through the local model before storing (lossy — see compression layer). Returns a matrix pointer. |
 | `offload_path` | Offload a file by path — server reads it, content never enters your context. Strongest form of context displacement. |
+| `checkout_remote` | Pull full body, distill via local model, return the distillate fenced as untrusted. Body on disk is unchanged; no checkin required. Falls back to plain `checkout` if no local model is configured. |
 | `pin` | Set salience to 1.0, mark entry pinned. Pinned entries survive `reap` and cleanup passes. |
 | `reap` | Delete stale entries by age and/or salience. Pinned entries are always spared. Use `dry_run: true` to preview. |
 | `forget` | Permanently delete an entry and its body file. |
@@ -98,13 +99,30 @@ redb was chosen over SQLite for zero C FFI. Linear scan over ~500 rows at <1ms �
 
 ## Installation
 
-### Build from source
+### Prerequisites
+
+Rust toolchain (stable, 1.80+). Install via [rustup.rs](https://rustup.rs) if you don't have it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### Build and install
 
 ```bash
 git clone https://github.com/alytaphoenix/context-hydra
 cd context-hydra
 cargo build --release
-# binary at target/release/context-hydra
+```
+
+Copy the binary somewhere on your PATH:
+
+```bash
+# macOS / Linux
+cp target/release/context-hydra /usr/local/bin/
+
+# or install directly from the repo
+cargo install --path .
 ```
 
 ### Configure as MCP server
@@ -156,6 +174,50 @@ Maintenance: `pin` high-value entries; `reap` stale ones periodically.
 | Transport | stdio |
 | Hashing | sha2 0.10 (SHA-256 for dedup) |
 | UUIDs | uuid 1.x with v4 |
+| HTTP client | reqwest 0.12 (rustls, no system OpenSSL) |
+| Config | toml 0.8 |
+
+---
+
+## Local model compression layer
+
+context-hydra can use a local LLM (any OpenAI-compatible endpoint) to compress and summarize content before it leaves the agent context or before it is returned for use with a remote model. This reduces token costs on the remote side without requiring the calling agent to do the compression work itself.
+
+### Two operations
+
+**Compress-on-offload (`offload` with `compress: true`):**
+Content is sent to the configured local model with a summarization prompt before being stored. The body file holds the compressed version. The original is gone — use this only for content where lossy compression is acceptable (completed reasoning traces, resolved error logs, finalized design notes). The stored summary field reflects the compressed content, not the original.
+
+**Checkout-for-remote (`checkout_remote`):**
+Pulls the full body, passes it through the local model to produce a token-efficient version, and returns the compressed output fenced as untrusted external data. The body on disk is unchanged. Use this when you need to inject stored content into a remote model's context at minimum cost — the remote model sees the distillate, not the raw body.
+
+These map to two specific use cases from kvasir's preprocessing layer:
+- **Ledger compression (#1):** `offload(compress: true)` stores a compressed ledger item. kvasir's `[c]ompress` action calls Ornith → `offload` → replaces the ledger item with a matrix pointer.
+- **Swarm handoff distillation (#3):** `checkout_remote` pulls a handoff entry and returns a distilled version sized for the receiving swarm node's context budget. The handoff payload is always the distillate, never the raw transcript.
+
+### Configuration
+
+The config file lives in the platform data directory:
+
+- **macOS:** `~/Library/Application Support/context-hydra/config.toml`
+- **Linux:** `~/.local/share/context-hydra/config.toml`
+
+```toml
+[local_model]
+base_url = "http://localhost:8000/v1"
+model = "Ornith-1.0-35B-4bit"
+api_key = ""                         # leave empty if endpoint requires no auth
+compress_target_tokens = 200         # target length for compress-on-offload
+checkout_remote_target_tokens = 300  # target length for checkout_remote distillation
+```
+
+If `[local_model]` is absent or `base_url` is empty, `compress: true` is silently ignored and `checkout_remote` falls back to plain `checkout`. If the model is configured but the call fails at runtime, `checkout_remote` returns an error rather than creating a hot checkout entry — use `checkout` directly in that case. The server never fails a call solely because compression is unavailable.
+
+### What the local model is not responsible for
+
+- **Relevance judgment.** context-hydra does not use the local model to decide which stored entries are relevant to the current task — that's the caller's responsibility via `search` and `recall`. Compression is mechanical (shorten this); relevance is semantic (which of these matters now).
+- **Summarizing before storing (by default).** The standard `offload` path is unchanged — no model call, no latency, no dependency. The local model is opt-in per call.
+- **Cross-entry synthesis.** `checkout_remote` operates on one entry at a time. Synthesizing across multiple entries requires the caller to compose them and send to their own model.
 
 ---
 

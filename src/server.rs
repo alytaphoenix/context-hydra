@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::store::{MatrixRow, Store};
+use crate::store::{LocalModelConfig, MatrixRow, Store, load_local_model_config};
 
 // ---------- session stats ----------
 
@@ -32,9 +32,11 @@ struct SessionStats {
     ref_offloads: u32,
     bytes_ref_offloaded: u64,
     dedup_hits: u32,
+    compress_offloads: u32,
     recalls: u32,
     checkouts: u32,
     checkins: u32,
+    checkout_remotes: u32,
     matrix_calls: u32,
     peek_calls: u32,
     searches: u32,
@@ -48,6 +50,8 @@ pub struct HydraServer {
     /// In-memory only: tracks when each id was last checked in this session.
     /// Used for min-cold-time warnings. Not persisted — naturally session-scoped.
     checkin_times: Arc<Mutex<HashMap<String, Instant>>>,
+    local_model: Option<LocalModelConfig>,
+    http_client: reqwest::Client,
 }
 
 impl HydraServer {
@@ -57,10 +61,18 @@ impl HydraServer {
         if cleaned > 0 {
             tracing::info!("startup: cleared {cleaned} stale hot entries");
         }
+        let local_model = load_local_model_config();
+        if let Some(ref cfg) = local_model {
+            tracing::info!("local model: {} @ {}", cfg.model, cfg.base_url);
+        }
         Ok(Self {
             store,
             stats: Arc::new(Mutex::new(SessionStats::default())),
             checkin_times: Arc::new(Mutex::new(HashMap::new())),
+            local_model,
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?,
         })
     }
 }
@@ -68,6 +80,7 @@ impl HydraServer {
 // ---------- helpers ----------
 
 const MIN_COLD_SECS: u64 = 30;
+const SUMMARY_CHARS: usize = 200;
 
 fn content_hash(s: &str) -> String {
     Sha256::digest(s.as_bytes())
@@ -125,6 +138,11 @@ pub struct OffloadParams {
     pub tags: Vec<String>,
     #[serde(default = "default_salience")]
     pub salience: f64,
+    /// If true and a local model is configured, run content through the model before storing.
+    /// Lossy — use only for completed traces, resolved errors, finalized notes.
+    /// Silently stores raw if compression is unavailable or fails.
+    #[serde(default)]
+    pub compress: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -274,10 +292,10 @@ impl HydraServer {
     /// Offload content out of active context. Deduplicates by content hash. Returns a matrix pointer.
     #[tool]
     async fn offload(&self, Parameters(p): Parameters<OffloadParams>) -> Result<String, String> {
-        let bytes = p.content.len() as u64;
         let (_, msg) = self
             .do_offload(
-                p.content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, false, bytes,
+                p.content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, false,
+                p.compress,
             )
             .await?;
         Ok(msg)
@@ -293,10 +311,9 @@ impl HydraServer {
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| format!("cannot read {}: {e}", p.path))?;
-        let bytes = content.len() as u64;
         let (_, msg) = self
             .do_offload(
-                content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, true, bytes,
+                content, p.ctx_type, p.topic, p.summary, p.tags, p.salience, false, true, false,
             )
             .await?;
         Ok(msg)
@@ -360,8 +377,6 @@ impl HydraServer {
             } else {
                 format!("{heading_line}\n{body}")
             };
-            let bytes = full_content.len() as u64;
-
             let (_, msg) = self
                 .do_offload(
                     full_content,
@@ -372,7 +387,7 @@ impl HydraServer {
                     p.salience,
                     p.pin,
                     true,
-                    bytes,
+                    false,
                 )
                 .await?;
             results.push(msg);
@@ -709,6 +724,54 @@ impl HydraServer {
         ))
     }
 
+    /// Pull full body, distill via local model, and return the distillate fenced as untrusted.
+    /// The body on disk is unchanged — no checkin required when compression is available.
+    /// Falls back to plain checkout (marks hot, requires checkin) if no local model is configured.
+    #[tool]
+    async fn checkout_remote(&self, Parameters(p): Parameters<IdParam>) -> Result<String, String> {
+        let Some(ref cfg) = self.local_model else {
+            return self.checkout(Parameters(p)).await;
+        };
+
+        let id = p.id.clone();
+        let body_path = self.store.body_path(&id);
+        if !body_path.exists() {
+            return Err(format!("not found: {id}"));
+        }
+        let content = tokio::fs::read_to_string(&body_path)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let store = self.store.clone();
+        let id2 = id.clone();
+        let row = tokio::task::spawn_blocking(move || store.get(&id2))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("not found: {id}"))?;
+
+        let target = cfg.checkout_remote_target_tokens;
+        let prompt = format!(
+            "Distill the following into approximately {target} tokens \
+             for efficient context injection. Preserve structure and key facts. \
+             Output ONLY the distillation, no preamble.\n\n{content}"
+        );
+        match self.call_llm(cfg, &prompt, target).await {
+            Some(distilled) => {
+                self.stats.lock().unwrap().checkout_remotes += 1;
+                let nonce = short_nonce();
+                let fenced = fence_body(&nonce, &row, &distilled);
+                Ok(format!(
+                    "distilled (no checkin needed)\n{}\n\n{fenced}",
+                    fmt_row(&row)
+                ))
+            }
+            None => Err(format!(
+                "local model call failed — use checkout to retrieve the full body (id: {id})"
+            )),
+        }
+    }
+
     /// Session operation counts and content volume. No token-savings claims — server
     /// cannot observe the context window. Use for behavioral diagnostics only.
     #[tool]
@@ -716,17 +779,19 @@ impl HydraServer {
         let s = self.stats.lock().unwrap();
         Ok(format!(
             "context-hydra session\n\
-             offloads  by-value:{} (~{}B)  by-ref:{} (~{}B)  dedup-hits:{}\n\
-             recalls:{}  checkouts:{}  checkins:{}\n\
+             offloads  by-value:{} (~{}B)  by-ref:{} (~{}B)  dedup-hits:{}  compressed:{}\n\
+             recalls:{}  checkouts:{}  checkins:{}  checkout-remote:{}\n\
              matrix:{}  peek:{}  search:{}",
             s.offloads,
             s.bytes_offloaded,
             s.ref_offloads,
             s.bytes_ref_offloaded,
             s.dedup_hits,
+            s.compress_offloads,
             s.recalls,
             s.checkouts,
             s.checkins,
+            s.checkout_remotes,
             s.matrix_calls,
             s.peek_calls,
             s.searches,
@@ -747,8 +812,10 @@ impl HydraServer {
         salience: f64,
         pin: bool,
         by_ref: bool,
-        bytes: u64,
+        compress: bool,
     ) -> Result<(String, String), String> {
+        // Hash the original — dedup keys off what the caller sent,
+        // not the compressed output (which varies under LLM nondeterminism).
         let hash = content_hash(&content);
 
         let store2 = self.store.clone();
@@ -758,7 +825,6 @@ impl HydraServer {
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         if let Some(mut existing_row) = existing {
-            // If pin requested and entry is not already pinned, pin it now.
             if pin && existing_row.status != "pinned" {
                 existing_row.status = "pinned".to_string();
                 existing_row.salience = 1.0;
@@ -775,6 +841,36 @@ impl HydraServer {
             return Ok((id, format!("duplicate: content already banked\n{}", fmt_row(&existing_row))));
         }
 
+        // Optional compression — silently falls back to raw on any failure.
+        let (stored_content, final_summary) = if compress {
+            if let Some(ref cfg) = self.local_model {
+                let target = cfg.compress_target_tokens;
+                let prompt = format!(
+                    "Compress the following to approximately {target} tokens. \
+                     Preserve all key facts, decisions, and findings. \
+                     Output ONLY the compressed version, no preamble.\n\n{content}"
+                );
+                match self.call_llm(cfg, &prompt, target).await {
+                    Some(compressed) => {
+                        self.stats.lock().unwrap().compress_offloads += 1;
+                        let derived: String = compressed
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(SUMMARY_CHARS)
+                            .collect();
+                        (compressed, derived)
+                    }
+                    None => (content, summary),
+                }
+            } else {
+                (content, summary)
+            }
+        } else {
+            (content, summary)
+        };
+
         let (status, final_salience) = if pin {
             ("pinned".to_string(), 1.0f64)
         } else {
@@ -783,12 +879,12 @@ impl HydraServer {
 
         let id = uuid::Uuid::new_v4().to_string();
         let row = MatrixRow {
-            token_estimate: estimate_tokens(&content),
+            token_estimate: estimate_tokens(&stored_content),
             id: id.clone(),
             ctx_type,
             topic,
             tags,
-            summary,
+            summary: final_summary,
             salience: final_salience,
             status,
             created_at: Utc::now(),
@@ -798,7 +894,7 @@ impl HydraServer {
         };
 
         let body_path = self.store.body_path(&id);
-        tokio::fs::write(&body_path, &content)
+        tokio::fs::write(&body_path, &stored_content)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -810,17 +906,51 @@ impl HydraServer {
             .map_err(|e| e.to_string())?;
 
         {
+            let stored_bytes = stored_content.len() as u64;
             let mut s = self.stats.lock().unwrap();
             if by_ref {
                 s.ref_offloads += 1;
-                s.bytes_ref_offloaded += bytes;
+                s.bytes_ref_offloaded += stored_bytes;
             } else {
                 s.offloads += 1;
-                s.bytes_offloaded += bytes;
+                s.bytes_offloaded += stored_bytes;
             }
         }
 
         Ok((id, format!("offloaded\n{}", fmt_row(&row))))
+    }
+
+    /// Call the configured local model. Returns None on any error — callers silently fall back.
+    async fn call_llm(
+        &self,
+        cfg: &LocalModelConfig,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Option<String> {
+        let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": cfg.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false
+        });
+
+        let mut req = self.http_client.post(&url).json(&body);
+        if !cfg.api_key.is_empty() {
+            req = req.bearer_auth(&cfg.api_key);
+        }
+
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!("local model returned {}", resp.status());
+            return None;
+        }
+
+        let json: serde_json::Value = resp.json().await.ok()?;
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     async fn read_matrix_resource(&self) -> ResourceContents {
