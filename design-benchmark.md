@@ -339,6 +339,59 @@ def matrix_row_tokens(matrix_output: str, n_entries: int) -> float:
     return total / max(n_entries, 1)
 ```
 
+### Compression evidence display
+
+Numbers alone don't prove the compression is meaningful — a model that outputs "..." achieves a perfect ratio but zero value. The harness prints a side-by-side excerpt so a human can judge whether the compressed output preserved what matters.
+
+For each content sample in S3 and S6, the output shows:
+
+```
+── error trace (10 KB → 200 tok) ────────────────────────────────────────────
+
+  ORIGINAL (first 400 chars):
+    ERROR: connection timeout after 30s
+      at src/client.rs:142 in fn send_request
+      at src/server.rs:87 in fn handle_connection
+    caused by: io::Error: connection refused (os error 111)
+    [... 9,600 more bytes ...]
+
+  COMPRESSED (full output, 200 tok target):
+    Connection timeout (30s) at client.rs:142/send_request →
+    server.rs:87/handle_connection. Cause: io::Error ECONNREFUSED (111).
+
+  KEY PHRASES retained (17/20):  connection timeout, 30s, client.rs:142,
+    send_request, server.rs:87, handle_connection, io::Error, ECONNREFUSED,
+    111  ✓  |  lost: [fn, os error]
+  Reduction: 2500 → 200 tok  (12.5×, 92% retained)
+```
+
+For the model comparison (S6), the same input produces a column for each model so the outputs can be compared directly:
+
+```
+── reasoning chain (20 KB) — model comparison ────────────────────────────────
+
+  ORIGINAL (first 200 chars):
+    Let me work through this step by step. The constraint is that auth must
+    complete before the database connection is opened. First, check if the
+    token is in the cache [...]
+
+  Ornith-1.0-35B-4bit (1.1s):
+    Auth must precede DB open. Token cache checked first; on miss, call
+    /auth endpoint with client_id. Cache TTL 300s. On failure, abort with
+    AuthError and log to stderr. DB uses connection pool (max 10).
+
+  gemma-4-26B-A4B MoE (0.4s):
+    Auth precedes DB. Token cache (300s TTL); on miss → /auth(client_id).
+    Failure: AuthError + stderr. DB pool max 10.
+
+  gemma-4-31B-it-OptiQ (1.4s):
+    Auth required before DB connection. Check token cache (TTL=300s); if
+    miss, call /auth with client_id. On failure: AuthError logged to stderr.
+    DB connection pool limited to 10.
+```
+
+This makes it immediately visible whether a faster/smaller model produces meaningfully worse summaries on your actual content types.
+
 ### Token reduction tracker
 
 Every compress/distill call records before and after token counts. The harness accumulates these into a per-content-type summary.
