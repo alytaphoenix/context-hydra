@@ -63,7 +63,7 @@ impl HydraServer {
         }
         let local_model = load_local_model_config();
         if let Some(ref cfg) = local_model {
-            tracing::info!("local model: {} @ {}", cfg.model, cfg.base_url);
+            tracing::info!("local model: {} @ {}", cfg.compression_model, cfg.base_url);
         }
         Ok(Self {
             store,
@@ -71,7 +71,7 @@ impl HydraServer {
             checkin_times: Arc::new(Mutex::new(HashMap::new())),
             local_model,
             http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()?,
         })
     }
@@ -757,7 +757,7 @@ impl HydraServer {
              Output ONLY the distillation, no preamble.\n\n{content}"
         );
         match self.call_llm(cfg, &prompt, target).await {
-            Some(distilled) => {
+            Some(distilled) if distilled.len() < content.len() => {
                 self.stats.lock().unwrap().checkout_remotes += 1;
                 let nonce = short_nonce();
                 let fenced = fence_body(&nonce, &row, &distilled);
@@ -766,8 +766,8 @@ impl HydraServer {
                     fmt_row(&row)
                 ))
             }
-            None => Err(format!(
-                "local model call failed — use checkout to retrieve the full body (id: {id})"
+            _ => Err(format!(
+                "local model call failed or expanded content — use checkout to retrieve the full body (id: {id})"
             )),
         }
     }
@@ -851,7 +851,10 @@ impl HydraServer {
                      Output ONLY the compressed version, no preamble.\n\n{content}"
                 );
                 match self.call_llm(cfg, &prompt, target).await {
-                    Some(compressed) => {
+                    Some(compressed) if compressed.len() < content.len() => {
+                        // Only accept the compressed output if it's actually shorter.
+                        // Models with thinking enabled can over-generate and return
+                        // content longer than the original — fall back to raw in that case.
                         self.stats.lock().unwrap().compress_offloads += 1;
                         let derived: String = compressed
                             .split_whitespace()
@@ -862,7 +865,7 @@ impl HydraServer {
                             .collect();
                         (compressed, derived)
                     }
-                    None => (content, summary),
+                    _ => (content, summary),
                 }
             } else {
                 (content, summary)
@@ -928,9 +931,13 @@ impl HydraServer {
         max_tokens: u32,
     ) -> Option<String> {
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+        // Thinking/reasoning models (e.g. Gemma 4) consume part of max_tokens for internal
+        // reasoning before producing visible output. Reserve enough budget for both: the
+        // visible output target plus up to 2048 tokens of reasoning overhead.
+        let api_max_tokens = max_tokens.saturating_add(2048);
         let body = serde_json::json!({
-            "model": cfg.model,
-            "max_tokens": max_tokens,
+            "model": cfg.compression_model,
+            "max_tokens": api_max_tokens,
             "messages": [{"role": "user", "content": prompt}],
             "stream": false
         });
@@ -947,7 +954,10 @@ impl HydraServer {
         }
 
         let json: serde_json::Value = resp.json().await.ok()?;
-        json["choices"][0]["message"]["content"]
+        let msg = &json["choices"][0]["message"];
+        // Only use visible content. reasoning_content is internal CoT and must not be stored
+        // as a compressed body — a thinking-only response means the model produced no output.
+        msg["content"]
             .as_str()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

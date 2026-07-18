@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalModelConfig {
     pub base_url: String,
-    pub model: String,
+    /// Model to use for compression and summarization operations only.
+    /// Must have thinking/reasoning mode disabled — see README for guidance.
+    /// Accepts `model` as a backwards-compatible alias.
+    #[serde(alias = "model")]
+    pub compression_model: String,
     #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_compress_target")]
@@ -27,12 +31,16 @@ struct RootConfig {
     local_model: Option<LocalModelConfig>,
 }
 
-/// Read `~/.local/share/context-hydra/config.toml` (platform-appropriate data dir).
+/// Read config.toml from `CONTEXT_HYDRA_DATA_DIR` (if set) or the platform data dir.
 /// Returns None if the file is absent, unparseable, or `base_url` is empty.
 pub fn load_local_model_config() -> Option<LocalModelConfig> {
-    let path = dirs::data_dir()?
-        .join("context-hydra")
-        .join("config.toml");
+    let path = if let Ok(dir) = std::env::var("CONTEXT_HYDRA_DATA_DIR") {
+        std::path::PathBuf::from(dir).join("config.toml")
+    } else {
+        dirs::data_dir()?
+            .join("context-hydra")
+            .join("config.toml")
+    };
     let text = std::fs::read_to_string(path).ok()?;
     match toml::from_str::<RootConfig>(&text) {
         Ok(root) => root.local_model.filter(|c| !c.base_url.is_empty()),
@@ -72,9 +80,13 @@ pub struct Store {
 
 impl Store {
     pub fn new() -> Result<Self> {
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("context-hydra");
+        let data_dir = std::env::var("CONTEXT_HYDRA_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::data_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("context-hydra")
+            });
         std::fs::create_dir_all(&data_dir)?;
         let bodies_dir = data_dir.join("bodies");
         std::fs::create_dir_all(&bodies_dir)?;

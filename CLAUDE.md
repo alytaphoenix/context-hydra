@@ -80,7 +80,9 @@ to use `recall` instead.
 | Find by topic | `search` |
 | Read summary | `recall` |
 | Pull full body | `checkout` → work → `checkin` |
+| Pull and distill body (no checkin) | `checkout_remote` |
 | Move content out (in context) | `offload` |
+| Move content out + compress | `offload` with `compress: true` |
 | Move file out (not in context) | `offload_path` |
 | Split markdown file by headings | `offload_path_sectioned` |
 | Preserve across sessions | `pin` |

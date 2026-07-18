@@ -4,17 +4,152 @@ Measures five things: operation latency, context displacement (tokens removed fr
 
 ---
 
+## Measured results (2026-07-17)
+
+These are real numbers from the implemented harness running on Apple M2 Mac mini, 64 GB RAM.
+
+### Schema overhead
+
+```
+Tool schema overhead: 1540 tokens per call (6160 chars / 4)
+
+  Tool                        desc  schema  total  ~tok
+  ────────────────────────── ─────  ──────  ─────  ────
+  offload_path_sectioned       482     937   1441   360   ← largest single tool
+  offload                       94     708    809   202
+  reap                         158     645    807   201
+  offload_path                  95     510    617   154
+  checkout_remote              262     139    416   104
+  search                        78     285    369    92
+  checkin                       79     255    341    85
+  checkout                     158     139    305    76
+  recall                        81     139    226    56
+  pin                           80     139    222    55
+  stats                        149      36    190    47
+  forget                        46     139    191    47
+  matrix                        75      36    117    29
+  peek                          69      36    109    27
+  TOTAL                                      6160  1540
+```
+
+### Context displacement (matrix row cost)
+
+```
+Header line:     9 tok  (38 chars)
+Per entry avg:  23 tok  (94 chars)
+Matrix at N:     9 + N × 23 tokens
+
+  N entries   matrix cost
+  ──────────  ──────────────
+           1     32 tok
+           5    124 tok
+          10    239 tok
+          20    469 tok
+          50  1,159 tok
+         100  2,309 tok
+         200  4,609 tok
+```
+
+Call `peek` instead of `matrix` when you only need counts. `peek` costs ~27 tokens to receive.
+
+### Break-even by content size
+
+Replacing X tokens in context with a 23-token matrix row saves X-23 tokens/turn. The 1540-token schema overhead is recouped after 1540/(X-23) turns.
+
+```
+  Content size   Saved/turn   Schema recoup   Schema + checkout recoup
+  ─────────────────────────────────────────────────────────────────────
+   100 tok          77 tok       20.0 turns           21.3 turns
+   200 tok         177 tok        8.7 turns            9.8 turns
+   300 tok         277 tok        5.6 turns            6.6 turns
+   400 tok         377 tok        4.1 turns            5.1 turns
+   500 tok         477 tok        3.2 turns            4.3 turns
+   800 tok         777 tok        2.0 turns            3.0 turns
+  1000 tok         977 tok        1.6 turns            2.6 turns
+```
+
+**Rule:** offloading ≥ 400-token content that stays out of context for 3+ turns always wins.
+**`offload_path` is always free** — the file never enters context at all.
+
+### Compression model comparison
+
+Benchmarked four content types on six models (all on oMLX, Apple Silicon 4-bit):
+
+```
+Model                                      RAM    Avg ratio  Avg lat   Efficiency
+─────────────────────────────────────────────────────────────────────────────────
+Qwen2.5-3B-Instruct-4bit                  2.3G      2.4×     4.3s        1.04
+Qwen2.5-7B-Instruct-4bit                  4.7G      2.3×     8.6s        0.50
+Ornith-1.0-35B-4bit:ornith-fast          19.8G      3.0×     5.6s        0.15
+gemma-4-26B-A4B-it-OptiQ-4bit:moe-fast  16.4G      2.3×    10.3s        0.14
+gemma-4-31B-it-OptiQ-4bit:q4-fast       20.8G      2.7×    38.8s        0.13
+gemma-4-31B-it-MLX-6bit:gemma-fast      24.9G      1.8×    50.7s        0.07
+
+Efficiency = avg compression ratio / RAM GB
+```
+
+Per content type (best model shown first in each):
+
+```
+Error trace (876 tok):
+  Qwen-7B      183 tok  (4.8×)   8.8s
+  Ornith       194 tok  (4.5×)  10.8s
+  Gemma-31B-q4 205 tok  (4.3×)  52.4s
+  Qwen-3B      217 tok  (4.0×)   5.4s
+  Gemma-26B    265 tok  (3.3×)  19.4s
+  Gemma-31B    876 tok  (1.0×)  60.0s  ← timeout
+
+Reasoning chain (821 tok):
+  Ornith       242 tok  (3.4×)   4.5s
+  Gemma-31B-q4 297 tok  (2.8×)  41.5s
+  Gemma-26B    300 tok  (2.7×)   7.8s
+  Qwen-7B      337 tok  (2.4×)   8.3s
+  Qwen-3B      410 tok  (2.0×)   4.8s
+
+Design note (356 tok):
+  Qwen-3B      136 tok  (2.6×)   1.5s
+  Gemma-31B-q4 248 tok  (1.4×)  27.4s
+  Gemma-31B    279 tok  (1.3×)  39.6s
+  Ornith       314 tok  (1.1×)   4.2s
+  Qwen-7B      332 tok  (1.1×)   6.2s
+  Gemma-26B    320 tok  (1.1×)   6.5s
+
+Rust source context (548 tok):
+  Ornith       172 tok  (3.2×)   3.0s   ← only model to compress code reliably
+  Gemma-31B-q4 226 tok  (2.4×)  33.9s
+  Gemma-31B    260 tok  (2.1×)  49.8s
+  Gemma-26B    268 tok  (2.0×)   7.3s
+  Qwen-3B      533 tok  (1.0×)   5.5s   ← expansion guard fired
+  Qwen-7B      540 tok  (1.0×)  11.1s   ← expansion guard fired
+```
+
+### Key findings
+
+**Small models are efficient but fragile on code.** Qwen-7B beats Ornith on error trace compression (4.8× vs 4.5×) at half the latency and ¼ the RAM. But both Qwen models fail on dense Rust source — the expansion guard fires because the model cannot reduce symbol-heavy code below the input length. Ornith is the only tested model that compresses code reliably.
+
+**Compression ratios are 2–5×, not 10–50×.** Pre-benchmark estimates were based on ideal prose content where reasoning steps are highly redundant. Real content mixes short design notes (1.1–2.6×), reasoning traces (2.0–3.4×), and code (1.0–3.2×). Average across content types: 2.3–3.0×.
+
+**Thinking mode is the critical parameter.** All models on oMLX are reasoning models. Without a fast profile (thinking disabled), the model spends the entire token budget on internal reasoning and returns empty visible output — compression silently falls back to raw storage. Fast profiles (`ornith-fast`, `gemma-moe-fast`, `gemma-q4-fast`) fix this.
+
+**Latency is the practical constraint for large models.** Gemma-31B-q4 achieves 2.7× compression (reasonable) but at 38.8s average latency. Gemma-31B-MLX at 50.7s average timed out on error traces (60s HTTP timeout). For synchronous compression workflows these are unusable. Qwen-7B at 8.6s is the practical upper bound for responsive use.
+
+**Compression targets in practice.** `compress_target_tokens = 200` produces 183–242 actual tokens on prose (models overshoot by 0–20%). Code ignores the target because the expansion guard discards the output anyway. `checkout_remote_target_tokens = 300` is appropriate as a non-destructive distillation budget.
+
+---
+
 ## What we measure and why
 
 ### 1. Schema overhead (one-time baseline)
 
-The tool descriptions are re-sent with every MCP request. This is the fixed cost of having context-hydra loaded. Measure it once so the savings estimates can net it out.
+The tool descriptions are re-sent with every MCP request. This is the fixed cost of having context-hydra loaded. Measure it once so savings estimates can net it out.
 
 **Metric:** token count of all tool descriptions combined, measured by sending a `tools/list` call and counting tokens in the response.
 
+**Measured:** ~1540 tokens. Run `python3 bench_hydra.py --window-analysis` to get the live number for the current binary.
+
 ### 2. Operation latency
 
-How fast are the primitives? Latency matters because slow tool calls interrupt agent flow.
+How fast are the primitives? Latency matters because slow tool calls interrupt agent flow. No latency measurements done yet — this is the next planned benchmark scenario.
 
 | Operation | What to measure |
 |---|---|
@@ -35,143 +170,146 @@ Each operation runs against three content sizes: small (1 KB), medium (10 KB), l
 
 The core value claim: content offloaded to hydra leaves the active window. The matrix row is tiny compared to the full body.
 
-**Displacement ratio:**
+**Measured:** matrix row averages 23 tokens. Body size is the full stored content.
+
 ```
-displaced_tokens = (body_bytes - matrix_row_bytes) / 4
-displacement_pct = displaced_tokens / (body_bytes / 4) × 100
+Displacement ratio = (body_tokens - 23) / body_tokens
+
+  1 KB  (~250 tok):   (250 - 23) / 250  = 91%
+  10 KB (~2500 tok):  (2500 - 23) / 2500 = 99%
+  100 KB (~25000 tok): essentially 100%
 ```
 
-Matrix row size is measured empirically from the `matrix` output (~15–20 tokens per row). Body size is the actual stored content.
+Use `peek` (27 tok to receive) rather than `matrix` when orienting — it avoids the per-row cost.
 
 ### 4. Token reduction per compaction
 
-Every compress or distill operation should report before/after token counts so the reduction is visible per call, not just in aggregate. This is the number that goes in the agent's feedback loop.
+Every compress or distill operation reports before/after token counts. Tracked per content type because content compresses differently.
 
-```
-tokens_in   = estimate_tokens(original_content)
-tokens_out  = estimate_tokens(stored_or_distilled_content)
-reduction   = tokens_in - tokens_out
-reduction_pct = reduction / tokens_in × 100
-```
+**Measured ratios** (see Results section above for full breakdown):
+- Error traces: 4.0–4.8× (best results, dense with identifiers and addresses)
+- Reasoning chains: 2.0–3.4× (step-by-step prose compresses well)
+- Design notes: 1.1–2.6× (structured prose with decisions, lower redundancy)
+- Rust source code: 1.0–3.2× (small models fail; only large dense models succeed)
 
-Tracked per content type (error trace, reasoning chain, design note, code context) because different content compresses differently. Reasoning chains tend to compress 10–50×; structured code context much less.
+Pre-benchmark estimate of 10–50× was based on idealized content. Actual ratios for realistic mixed content average 2–3×.
 
 ### 5. Compression model comparison
 
-Which model gives the best token reduction per GB of RAM? This is the key question for choosing the local compression model. A 3B MoE model that achieves 80% of the compression quality of a 35B dense at 15% of the RAM cost is a clear winner.
+Which model gives the best token reduction per GB of RAM? See full results in the Measured results section above.
+
+**Summary:**
+- RAM-efficient choice: Qwen2.5-7B-Instruct-4bit (0.50 efficiency, 4.8× on errors, 8.6s avg)
+- Lowest RAM: Qwen2.5-3B-Instruct-4bit (1.04 efficiency, but fails on code)
+- Code-capable: Ornith-1.0-35B-4bit with fast profile (3.2× on source, 5.6s avg, 19.8 GB)
+- Avoid for compression: Gemma-31B-MLX-6bit (0.07 efficiency, 50s latency)
+
+**Key question answered:** compression quality does drop below useful at 3B on code. The 3–7B range works well for prose. Code needs a larger model.
 
 **Evaluation dimensions:**
 
 | Dimension | How measured |
 |---|---|
 | RAM footprint | model size on disk (GB) as proxy for loaded RAM |
-| Compress latency | wall time for a single compress call at 10 KB input |
-| Distill latency | wall time for a single distill call at 10 KB input |
+| Compress latency | wall time per compress call |
 | Token reduction | `tokens_in / tokens_out` ratio |
-| Quality score | key-phrase retention rate (see below) |
+| Quality score | key-phrase retention rate |
+| Efficiency | token_reduction_ratio / RAM_GB |
 
 **Quality scoring — key-phrase retention:**
 
-After compressing a known piece of content, extract the top-N important phrases from the original (nouns, identifiers, numbers, error messages) and check what fraction appear verbatim in the compressed output. Not perfect, but objective and fast.
-
 ```python
 import re
+from collections import Counter
 
 def key_phrases(text: str, n=20) -> set[str]:
-    # Identifiers, numbers, quoted strings, error terms
-    tokens = re.findall(r'\b[A-Z][a-z]+[A-Z]\w*\b'   # camelCase
-                       r'|\b[a-z_]+::[a-z_]+\b'       # rust paths
-                       r'|\b\d+\b'                     # numbers
-                       r'|"[^"]{3,30}"'                # short strings
-                       r'|\bERROR\b|\bPANIC\b|\bWARN\b', text)
-    # Return top-N by frequency
-    from collections import Counter
+    tokens = re.findall(
+        r'\b[A-Z][a-z]+[A-Z]\w*\b'   # camelCase
+        r'|\b[a-z_]+::[a-z_]+\b'     # rust paths
+        r'|\b\d+\b'                   # numbers
+        r'|"[^"]{3,30}"'              # short strings
+        r'|\bERROR\b|\bPANIC\b|\bWARN\b', text)
     return {t for t, _ in Counter(tokens).most_common(n)}
 
 def retention_score(original: str, compressed: str, n=20) -> float:
     phrases = key_phrases(original, n)
     if not phrases:
         return 1.0
-    retained = sum(1 for p in phrases if p in compressed)
-    return retained / len(phrases)
+    return sum(1 for p in phrases if p in compressed) / len(phrases)
 ```
 
-**Models to compare** (those available on the local oMLX server):
+**Models benchmarked:**
 
-| Model | RAM (GB) | Arch | Notes |
+| Model | RAM (GB) | Status | Notes |
 |---|---|---|---|
-| Ornith-1.0-35B-4bit | 19.8 | dense | current default |
-| gemma-4-26B-A4B-it-OptiQ-4bit | 16.4 | MoE | 4B active, fast |
-| gemma-4-31B-it-OptiQ-4bit | 20.8 | dense | OptiQ mixed quant |
-| gemma-4-31B-it-MLX-6bit | 24.9 | dense | higher quality baseline |
+| Ornith-1.0-35B-4bit | 19.8 | ✅ benchmarked | Best on code and reasoning; needs `ornith-fast` profile |
+| gemma-4-26B-A4B-it-OptiQ-4bit | 16.4 | ✅ benchmarked | MoE; `gemma-moe-fast` profile needed |
+| gemma-4-31B-it-OptiQ-4bit | 20.8 | ✅ benchmarked | `gemma-q4-fast` profile; 38s avg latency |
+| gemma-4-31B-it-MLX-6bit | 24.9 | ✅ benchmarked | Slow (50s avg), times out on error traces |
+| Qwen2.5-7B-Instruct-4bit | 4.7 | ✅ benchmarked | Best efficiency for prose; fails on code |
+| Qwen2.5-3B-Instruct-4bit | 2.3 | ✅ benchmarked | Highest RAM efficiency; fails on code |
+| gemma-3-4b-it-qf16 | 3.5 | ❌ gated HF repo | Could not download (requires HF token) |
+| SmolLM2-1.7B-Instruct-4bit | 1.1 | ❌ gated HF repo | Could not download |
+| Llama-3.2-3B-Instruct-4bit | 2.0 | not downloaded | Non-gated; next candidate |
+| Phi-3.5-mini-instruct-4bit | 2.3 | not downloaded | Non-gated; next candidate |
 
-If Qwen3-Coder-30B-A3B is downloaded (~17 GB), include it — it's purpose-built for structured content which may compress more faithfully.
-
-**Expected output shape:**
-
-```
-COMPRESSION MODEL COMPARISON
-Content: error trace (10 KB, ~2500 tokens)
-
-Model                           RAM     Compress  Distill   Tok reduction  Retention
-                                (GB)    latency   latency   (ratio / %)    score
-──────────────────────────────────────────────────────────────────────────────────────
-Ornith-1.0-35B-4bit             19.8    1.1s      0.8s      8.3× / 88%     0.91
-gemma-4-26B-A4B-it-OptiQ-4bit   16.4    0.4s      0.3s      7.1× / 86%     0.87
-gemma-4-31B-it-OptiQ-4bit       20.8    1.4s      1.0s      8.8× / 89%     0.93
-gemma-4-31B-it-MLX-6bit         24.9    4.1s      2.9s      9.1× / 89%     0.94
-
-Efficiency (token_reduction_ratio / RAM_GB):
-  gemma-4-26B-A4B-it-OptiQ-4bit   0.43  ← best tokens-saved per GB
-  gemma-4-31B-it-OptiQ-4bit       0.42
-  Ornith-1.0-35B-4bit             0.42
-  gemma-4-31B-it-MLX-6bit         0.37
-```
-
-The efficiency metric `token_reduction_ratio / RAM_GB` is the primary ranking signal — it answers "how much compression per GB of RAM invested?"
-
-### 7. Cost savings estimate
-
-Assumptions (parameterizable):
-- Token ≈ 4 bytes (GPT-4 / Claude approximation)
-- Session = N turns, each turn re-sends the full context window
-- Pricing: configurable per model (default: $15/M input tokens for a frontier model)
+### 6. Cost savings estimate
 
 ```
-tokens_in_body  = body_bytes / 4
-tokens_in_row   = ~18  (matrix row, empirically measured)
-displaced_per_turn = tokens_in_body - tokens_in_row
-cost_saved_per_session = displaced_per_turn × turns × price_per_token
+PRICE_PER_M_TOKENS = 15.00  # USD frontier model input — override as needed
+
+tokens_saved_per_turn = body_tokens - 23   (matrix row)
+total_saved = tokens_saved_per_turn × turns
+usd_saved   = (total_saved / 1_000_000) × price_per_m
 ```
 
-For compress path:
+Break-even for the schema overhead (1540 tokens) against offloaded content:
+
 ```
-compressed_tokens  = stored_bytes / 4
-displaced_per_turn = tokens_in_body - compressed_tokens
+  Content      Saved/turn   Break-even turns
+  ─────────────────────────────────────────
+   400 tok       377 tok       4.1 turns
+   500 tok       477 tok       3.2 turns
+   800 tok       777 tok       2.0 turns
+  1000 tok       977 tok       1.6 turns
 ```
+
+For a 20-turn session offloading 5 × 500-token entries (realistic: error traces, reasoning steps):
+
+```
+  Offloaded tokens:   2500
+  Schema overhead:    1540 / call × N calls (varies)
+  Saved per turn:     2500 - 5×23 = 2385 tok
+  Session total:      2385 × 20 = 47,700 tok saved
+  USD saved:          $0.00072  (at $15/M)
+```
+
+The token savings per session are real but modest at current frontier pricing. The more significant benefit at long sessions is reasoning quality from a leaner context, which is not measurable server-side.
 
 ---
 
 ## Test scenarios
 
-### S1 — Single-entry latency
+### S1 — Single-entry latency (not yet implemented)
 
 Offload one entry, recall it, checkout, checkin. Repeat for 1 KB / 10 KB / 100 KB bodies. Measures baseline operation cost.
 
-### S2 — Scale test
+### S2 — Scale test (not yet implemented)
 
 Build a store of 10 / 100 / 500 entries. Measure `peek`, `matrix`, and `search` latency vs entry count. Verifies the README claim that linear scan over ~500 rows is <1ms.
 
-### S3 — Compression pipeline
+### S3 — Compression pipeline ✅ implemented as `--compare-models`
 
-For a set of realistic content samples (error traces, reasoning chains, design notes):
+For a set of realistic content samples (error traces, reasoning chains, design notes, code):
 1. Offload raw → measure stored size
 2. Offload same content with `compress: true` → measure stored size
 3. Checkout raw body → measure response size
 4. `checkout_remote` → measure distillate size
 5. Report compression ratio and latency for each step
 
-### S4 — Session simulation
+**Results:** see Measured results section above.
+
+### S4 — Session simulation (not yet implemented)
 
 Simulate a realistic 20-turn coding agent session:
 - Turn 1: read 3 files → offload_path each
@@ -181,28 +319,28 @@ Simulate a realistic 20-turn coding agent session:
 - Turn 13: resolve; offload(compress: true) the now-stale trace
 - Turns 14–20: new task; matrix to orient
 
-Measure total bytes that would have accumulated in context without hydra vs the matrix + checkout traffic that actually occurred. Compute tokens and cost delta.
+Measure total bytes that would have accumulated in context without hydra vs the matrix + checkout traffic that actually occurred.
 
-### S5 — Cross-session persistence
+### S5 — Cross-session persistence (not yet implemented)
 
 Populate a store, restart the binary, verify entries survive and stale hot entries are cleaned up. Confirms the startup_cleanup path and redb persistence guarantee.
 
-### S6 — Compression model comparison
+### S6 — Compression model comparison ✅ implemented as `--compare-models`
 
-For each model available on the oMLX server:
+For each model available on the local endpoint:
 1. Configure `config.toml` to point at that model
-2. Reload context-hydra (restart the subprocess — it reads config at startup)
-3. Run compress and distill against the same 5 fixed content samples:
-   - `trace_10k`: a 10 KB error trace with stack frames, identifiers, line numbers
-   - `reason_20k`: a 20 KB reasoning chain (thinking block style)
-   - `design_5k`: a 5 KB design note with decisions and tradeoffs
-   - `code_15k`: a 15 KB code context (function + surrounding file)
-   - `mixed_30k`: mixed content, 30 KB
-
-4. Record: compress latency, distill latency, token_in, token_out, reduction ratio, retention score
+2. Restart the subprocess (context-hydra reads config at startup)
+3. Run compress and distill against fixed content samples
+4. Record: compress latency, token_in, token_out, reduction ratio, retention score
 5. Rank by efficiency metric: `reduction_ratio / ram_gb`
 
-Content samples are deterministic (seeded, pre-generated) so results are comparable across runs and machines.
+**Results:** see Measured results section above.
+
+### S7 — Window analysis ✅ implemented as `--window-analysis`
+
+Measures schema overhead, matrix row cost, break-even by content size, and compression target recommendations. Output is a human-readable report.
+
+**Results:** see Measured results section above.
 
 ---
 
@@ -210,398 +348,77 @@ Content samples are deterministic (seeded, pre-generated) so results are compara
 
 The harness is a Python script (`bench_hydra.py`) that drives context-hydra via its native MCP stdio protocol. No HTTP layer, no mock — talks to the real binary.
 
+### CLI flags (current)
+
+```
+python3 bench_hydra.py [--binary PATH] [--model MODEL_ID]
+                       [--compare-models] [--window-analysis]
+                       [--suggest-models] [--quick]
+                       [--omlx-url URL] [--api-key KEY]
+
+--binary          path to context-hydra binary (default: auto-detect)
+--model           local model ID for single compress/distill scenario
+--compare-models  sweep all models on --omlx-url, rank by efficiency
+--window-analysis measure schema overhead, matrix cost, break-even, targets
+--suggest-models  print small model download suggestions with HF paths
+--quick           run error_trace sample only (fastest sanity check)
+--omlx-url        local model server URL (default: http://localhost:8000)
+--api-key         auth token (auto-detected from ~/.omlx/settings.json)
+```
+
+### CLI flags (planned)
+
+```
+--runs N          repetitions per latency measurement (default: 5)
+--no-compress     skip compression (for environments without local model)
+--no-simulation   skip session simulation
+--price FLOAT     price per 1M input tokens in USD (default: 15.0)
+--turns N         simulated session length (default: 20)
+--sizes BYTES     comma-separated body sizes to test (default: 1024,10240,102400)
+```
+
 ### MCP stdio driver
 
-```python
-import subprocess, json, threading, queue, time
-
-class HydraClient:
-    def __init__(self, binary: str):
-        self.proc = subprocess.Popen(
-            [binary],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self._id = 0
-        self._pending = {}
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
-        self._init()
-
-    def _next_id(self):
-        self._id += 1
-        return self._id
-
-    def _send(self, msg: dict):
-        line = json.dumps(msg) + "\n"
-        self.proc.stdin.write(line.encode())
-        self.proc.stdin.flush()
-
-    def _read_loop(self):
-        for line in self.proc.stdout:
-            msg = json.loads(line)
-            if "id" in msg and msg["id"] in self._pending:
-                self._pending[msg["id"]].put(msg)
-
-    def _rpc(self, method: str, params: dict, timeout=30) -> dict:
-        id_ = self._next_id()
-        q = queue.Queue()
-        self._pending[id_] = q
-        self._send({"jsonrpc": "2.0", "id": id_, "method": method, "params": params})
-        result = q.get(timeout=timeout)
-        del self._pending[id_]
-        return result
-
-    def _init(self):
-        self._rpc("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "bench", "version": "0.1"},
-        })
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-
-    def call(self, tool: str, args: dict, timeout=60) -> str:
-        resp = self._rpc("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
-        if "error" in resp:
-            raise RuntimeError(resp["error"])
-        return resp["result"]["content"][0]["text"]
-
-    def timed(self, tool: str, args: dict, timeout=60) -> tuple[str, float]:
-        t0 = time.perf_counter()
-        result = self.call(tool, args, timeout=timeout)
-        return result, time.perf_counter() - t0
-
-    def close(self):
-        self.proc.stdin.close()
-        self.proc.wait()
-```
-
-### Synthetic content generator
-
-```python
-import random, string
-
-def gen_content(size_bytes: int, style="trace") -> str:
-    """Generate realistic-looking content of a target byte size."""
-    if style == "trace":
-        # Simulate an error trace
-        lines = [
-            "ERROR: connection timeout after 30s",
-            "  at src/client.rs:142 in fn send_request",
-            "  at src/server.rs:87 in fn handle_connection",
-            "caused by: io::Error: connection refused (os error 111)",
-        ]
-        base = "\n".join(lines) + "\n"
-    elif style == "reasoning":
-        # Simulate a reasoning chain
-        base = ("Let me think through this step by step. "
-                "First, I need to consider the initial conditions. "
-                "The constraint is that X must be satisfied before Y. "
-                "Working backwards from the goal... ") * 4
-    else:
-        base = "Design note: " + " ".join(
-            random.choices(string.ascii_letters, k=40)
-        ) + "\n"
-    
-    # Repeat to hit target size
-    repeats = max(1, size_bytes // len(base)) + 1
-    return (base * repeats)[:size_bytes]
-```
-
-### Measurement loop
-
-```python
-import statistics
-
-def measure_op(client, tool, args, runs=5, timeout=60):
-    latencies = []
-    for _ in range(runs):
-        _, t = client.timed(tool, args, timeout=timeout)
-        latencies.append(t * 1000)  # ms
-    return {
-        "median_ms": statistics.median(latencies),
-        "p95_ms":    sorted(latencies)[int(len(latencies) * 0.95)],
-        "min_ms":    min(latencies),
-    }
-```
+The `HydraClient` class in `bench_hydra.py` implements the full MCP handshake over stdio:
+- Daemon reader thread with per-request `queue.Queue` for responses
+- `call(tool, args)` — synchronous tool call with timeout
+- `timed(tool, args)` — returns `(response, elapsed_seconds)`
+- `tools_list()` — returns raw tools schema for overhead measurement
 
 ### Token estimation
 
 ```python
 def estimate_tokens(text: str) -> int:
     return (len(text.encode("utf-8")) + 3) // 4
-
-def matrix_row_tokens(matrix_output: str, n_entries: int) -> float:
-    """Avg tokens per matrix row from live output."""
-    total = estimate_tokens(matrix_output)
-    header_lines = 1
-    return total / max(n_entries, 1)
 ```
 
-### Compression evidence display
+4 chars per token is accurate within ~10% for English prose and code. Not suitable for exact billing calculations but sufficient for relative comparisons within the harness.
 
-Numbers alone don't prove the compression is meaningful — a model that outputs "..." achieves a perfect ratio but zero value. The harness prints a side-by-side excerpt so a human can judge whether the compressed output preserved what matters.
-
-For each content sample in S3 and S6, the output shows:
-
-```
-── error trace (10 KB → 200 tok) ────────────────────────────────────────────
-
-  ORIGINAL (first 400 chars):
-    ERROR: connection timeout after 30s
-      at src/client.rs:142 in fn send_request
-      at src/server.rs:87 in fn handle_connection
-    caused by: io::Error: connection refused (os error 111)
-    [... 9,600 more bytes ...]
-
-  COMPRESSED (full output, 200 tok target):
-    Connection timeout (30s) at client.rs:142/send_request →
-    server.rs:87/handle_connection. Cause: io::Error ECONNREFUSED (111).
-
-  KEY PHRASES retained (17/20):  connection timeout, 30s, client.rs:142,
-    send_request, server.rs:87, handle_connection, io::Error, ECONNREFUSED,
-    111  ✓  |  lost: [fn, os error]
-  Reduction: 2500 → 200 tok  (12.5×, 92% retained)
-```
-
-For the model comparison (S6), the same input produces a column for each model so the outputs can be compared directly:
-
-```
-── reasoning chain (20 KB) — model comparison ────────────────────────────────
-
-  ORIGINAL (first 200 chars):
-    Let me work through this step by step. The constraint is that auth must
-    complete before the database connection is opened. First, check if the
-    token is in the cache [...]
-
-  Ornith-1.0-35B-4bit (1.1s):
-    Auth must precede DB open. Token cache checked first; on miss, call
-    /auth endpoint with client_id. Cache TTL 300s. On failure, abort with
-    AuthError and log to stderr. DB uses connection pool (max 10).
-
-  gemma-4-26B-A4B MoE (0.4s):
-    Auth precedes DB. Token cache (300s TTL); on miss → /auth(client_id).
-    Failure: AuthError + stderr. DB pool max 10.
-
-  gemma-4-31B-it-OptiQ (1.4s):
-    Auth required before DB connection. Check token cache (TTL=300s); if
-    miss, call /auth with client_id. On failure: AuthError logged to stderr.
-    DB connection pool limited to 10.
-```
-
-This makes it immediately visible whether a faster/smaller model produces meaningfully worse summaries on your actual content types.
-
-### Token reduction tracker
-
-Every compress/distill call records before and after token counts. The harness accumulates these into a per-content-type summary.
+### Quality scoring
 
 ```python
-def measure_compression(client, content: str, tool="offload", extra_args=None) -> dict:
-    args = {
-        "content": content,
-        "ctx_type": "trace",
-        "topic": "bench",
-        "summary": "bench",
-        "compress": True,
-    }
-    if extra_args:
-        args.update(extra_args)
+def key_phrases(text: str, n: int = 20) -> list[str]:
+    """Extract top-N identifiers, numbers, and error terms by frequency."""
+    ...
 
-    tokens_in = estimate_tokens(content)
-
-    if tool == "offload":
-        result, latency = client.timed("offload", args)
-        # Retrieve the stored body to measure tokens_out
-        entry_id = result.split("\n")[1].split(" | ")[0].strip()
-        body, _ = client.timed("checkout", {"id": entry_id})
-        # Body is fenced; strip the fence tags
-        body_text = re.sub(r"<hydra:body:[0-9a-f]+[^>]*>|</hydra:body:[0-9a-f]+>", "", body).strip()
-        tokens_out = estimate_tokens(body_text)
-        client.call("checkin", {"id": entry_id, "nonce": re.search(r"checkout nonce: (\w+)", body).group(1)})
-    else:  # checkout_remote
-        result, latency = client.timed("checkout_remote", {"id": extra_args["id"]})
-        tokens_out = estimate_tokens(result)
-
-    return {
-        "tokens_in":      tokens_in,
-        "tokens_out":     tokens_out,
-        "reduction":      tokens_in - tokens_out,
-        "reduction_pct":  round((tokens_in - tokens_out) / tokens_in * 100, 1),
-        "ratio":          round(tokens_in / max(tokens_out, 1), 1),
-        "latency_ms":     round(latency * 1000, 0),
-        "retention":      retention_score(content, result),
-    }
+def retention_score(original: str, compressed: str) -> tuple[float, list[str], list[str]]:
+    """Returns (score, kept_phrases, lost_phrases)."""
+    ...
 ```
 
-### Cost model
+Both implemented in `bench_hydra.py`. Used to verify that compression preserves meaningful content rather than just achieving a low token count.
 
-```python
-PRICE_PER_M_TOKENS = 15.00  # USD, frontier model input — override as needed
+### Expansion safeguard (in server.rs)
 
-def cost_saved(
-    body_bytes: int,
-    stored_bytes: int,   # after compression (= body_bytes if no compress)
-    row_tokens: float,   # avg matrix row size
-    turns: int,
-    price_per_m: float = PRICE_PER_M_TOKENS,
-) -> dict:
-    body_tokens   = body_bytes / 4
-    stored_tokens = stored_bytes / 4
-    # Without hydra: body_tokens in context every turn
-    # With hydra: row_tokens in matrix every turn, stored_tokens only on checkout
-    tokens_saved_per_turn = body_tokens - row_tokens
-    total_tokens_saved    = tokens_saved_per_turn * turns
-    usd_saved             = (total_tokens_saved / 1_000_000) * price_per_m
-    compress_ratio        = body_bytes / stored_bytes if stored_bytes > 0 else 1.0
-    return {
-        "body_tokens":         int(body_tokens),
-        "stored_tokens":       int(stored_tokens),
-        "row_tokens":          round(row_tokens, 1),
-        "tokens_saved_per_turn": int(tokens_saved_per_turn),
-        "total_tokens_saved":  int(total_tokens_saved),
-        "usd_saved":           round(usd_saved, 4),
-        "compress_ratio":      round(compress_ratio, 2),
-    }
-```
-
----
-
-## Output format
-
-The harness prints a human-readable report and saves JSON results to `~/.local/share/context-hydra/bench_results.json` (macOS: `~/Library/Application Support/context-hydra/bench_results.json`).
-
-```
-================================================================================
-  context-hydra benchmark — 2026-07-16
-================================================================================
-
-SCHEMA OVERHEAD
-  tool descriptions: 1,842 tokens  (~$0.028/M-token model per request)
-
-OPERATION LATENCY  (median / p95 ms, n=5 runs each)
-  Content size       1 KB      10 KB     100 KB
-  ─────────────────────────────────────────────
-  offload             3 /  5   5 /  8    22 / 31
-  offload (compress)  850/ 920  1100/1180 2100/2300
-  checkout            2 /  3   3 /  4    14 / 18
-  checkout_remote     620/ 680  800/ 850 1500/1620
-  checkin             1 /  2   1 /  2     1 /  2
-  peek                1 /  1   1 /  1     1 /  1
-  matrix (100 entries) 3 /  4  —         —
-  search (100 entries) 3 /  4  —         —
-  recall              1 /  2   1 /  2     1 /  2
-
-CONTEXT DISPLACEMENT  (per offloaded entry)
-  Avg matrix row: ~18 tokens
-  Content size     Body tokens  Row tokens  Displaced  Pct
-  ─────────────────────────────────────────────────────────
-  1 KB               250          18          232      93%
-  10 KB             2,500         18         2,482     99%
-  100 KB           25,000         18        24,982     99.9%
-
-TOKEN REDUCTION PER COMPACTION  (local model: Ornith-1.0-35B-4bit)
-  Content               Tokens in  Tokens out  Reduction  Ratio   Retention  Latency
-  ────────────────────────────────────────────────────────────────────────────────────
-  error trace (10 KB)     2,500        200       2,300    12.5×     0.91      1.1s
-  reasoning (20 KB)       5,000        200       4,800    25.0×     0.83      1.4s
-  design note (5 KB)      1,250        200       1,050     6.3×     0.94      0.9s
-  code context (15 KB)    3,750        200       3,550    18.8×     0.89      1.2s
-  mixed (30 KB)           7,500        200       7,300    37.5×     0.86      1.8s
-
-  checkout_remote distillation (same content, stored body → distillate):
-  Content               Tokens in  Tokens out  Reduction  Ratio   Retention  Latency
-  ────────────────────────────────────────────────────────────────────────────────────
-  error trace (10 KB)     2,500        300       2,200     8.3×     0.93      0.8s
-  code context (15 KB)    3,750        300       3,450    12.5×     0.91      1.0s
-
-COST SAVINGS ESTIMATE  ($15/M input tokens, 20-turn session)
-  Scenario              Tokens saved/turn  Session total  USD saved
-  ──────────────────────────────────────────────────────────────────
-  1 file (10 KB)              2,482          49,640        $0.00074
-  5 files (10 KB ea)         12,410         248,200        $0.00373
-  Long session (500 KB total) 124,982      2,499,640       $0.03749
-  + compression (50× ratio)  124,782      2,495,640       $0.03743
-
-SCALE TEST  (latency vs store size)
-  Entries   peek ms   matrix ms   search ms
-  ─────────────────────────────────────────
-  10          1          2           2
-  100         1          4           4
-  500         2         18          14
-
-SESSION SIMULATION  (20-turn coding session, 3 files + traces)
-  Without hydra:  ~62,000 tokens accumulated in context
-  With hydra:     ~4,200 tokens in active context (matrix + one checkout)
-  Net reduction:  ~93%  |  USD saved: $0.0086
-
-================================================================================
-Results → ~/Library/Application Support/context-hydra/bench_results.json
-```
-
----
-
-## CLI flags
-
-```
-bench_hydra.py [--binary PATH] [--runs N] [--no-compress] [--no-simulation]
-               [--price FLOAT] [--turns N] [--sizes 1024,10240,102400]
-               [--model MODEL_ID] [--compare-models] [--omlx-url URL]
-
---binary          path to context-hydra binary (default: $(which context-hydra))
---runs            repetitions per latency measurement (default: 5)
---no-compress     skip compression scenarios (for environments without a local model)
---no-simulation   skip the full session simulation
---price           price per 1M input tokens in USD (default: 15.0)
---turns           simulated session length (default: 20)
---sizes           comma-separated body sizes in bytes to test
---model           local model id for a single compress/distill scenario
---compare-models  run S6 model comparison across all models found on --omlx-url
---omlx-url        oMLX server base URL for model comparison (default: http://localhost:8000)
-```
-
----
-
-## README integration
-
-The benchmark results section in README.md should show one canonical run with real numbers. Structure:
-
-```markdown
-## Performance
-
-Results from a single Mac mini (Apple M2, 64 GB RAM) running context-hydra 0.1.
-
-### Operation latency (median)
-
-| Operation | 1 KB | 10 KB | 100 KB |
-|---|---|---|---|
-| offload | Xms | Xms | Xms |
-| checkout | Xms | Xms | Xms |
-| recall | Xms | Xms | Xms |
-
-### Context displacement
-
-At 10 KB per entry, a single offload removes ~2,482 tokens from the active window
-while adding ~18 tokens to the matrix. Displacement ratio: 99%.
-
-### Cost savings (illustrative)
-
-A 20-turn session working across 5 open files (10 KB each) saves ~248K tokens
-per session — roughly $0.004 at $15/M input tokens. At 100 sessions/month that's
-~$0.37/month saved, before accounting for reasoning quality improvements from
-a leaner context.
-
-See `design-benchmark.md` for methodology and `bench_hydra.py` to run locally.
-```
-
-The numbers in the README should come from an actual run, not from this design doc.
+If `call_llm` returns output ≥ the original content length in bytes, the compressed output is discarded and the raw content is stored instead. This prevents models from expanding inputs (observed with Gemma MoE thinking mode on) from corrupting stored entries.
 
 ---
 
 ## Implementation notes
 
-- Use a fresh redb store for each benchmark run: start the binary with `CONTEXT_HYDRA_DATA_DIR=/tmp/bench-$$` (requires adding env var support to the binary) or wipe `~/.local/share/context-hydra/` before each run. The cleaner approach is an `--data-dir` flag on the binary.
-- The schema overhead measurement requires listing tools and counting response bytes before any tool calls. Do this as the first operation after `initialized`.
-- For compression benchmarks, use `--no-compress` if no local model is running — the harness should detect and skip gracefully rather than fail.
-- The session simulation should use deterministic content (seeded RNG) so results are reproducible across machines.
-- Run the scale test last — it leaves the store in a populated state that would skew latency measurements if run first.
+- **Config reload:** context-hydra reads `config.toml` at startup. The harness restarts a new subprocess per model when comparing models.
+- **Thinking mode:** all current oMLX models are reasoning models. Without fast profiles, compression silently falls back to raw storage. The harness's `_compression_model_list()` auto-selects fast profiles where available (any profile ending in `-fast`).
+- **oMLX API key:** auto-detected from `~/.omlx/settings.json` → `auth.api_key`.
+- **Model registration:** newly downloaded models require an oMLX server restart (`omlx-cli restart`) to appear in `/v1/models`.
+- **Code content:** do not use `compress: true` on code — small models expand it and the expansion guard stores raw. Use `offload` raw and `checkout_remote` for distillation at retrieval time.
+- **Fresh store for benchmarks:** there is no `--data-dir` flag yet. The harness uses the real store and cleans up test entries with `forget` after each run.

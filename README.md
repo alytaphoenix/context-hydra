@@ -35,13 +35,14 @@ Agents interact via MCP tools. The matrix is always cheap to read; full bodies a
 | `recall` | Read one entry's summary without pulling the full body. No state change. |
 | `checkout` | Pull full body into context. Issues a nonce; marks entry hot. Body is fenced as untrusted. Warns on recent re-checkout (churn signal). |
 | `checkin` | Return a checked-out entry. Requires the nonce from `checkout`. Marks entry cold. |
-| `offload` | Move content out of active context. Deduplicates by content hash. Pass `compress: true` to run through the local model before storing (lossy — see compression layer). Returns a matrix pointer. |
+| `offload` | Move content out of active context. Deduplicates by content hash. Pass `compress: true` to run through the local model before storing (lossy). Returns a matrix pointer. |
 | `offload_path` | Offload a file by path — server reads it, content never enters your context. Strongest form of context displacement. |
-| `checkout_remote` | Pull full body, distill via local model, return the distillate fenced as untrusted. Body on disk is unchanged; no checkin required. Falls back to plain `checkout` if no local model is configured. |
+| `offload_path_sectioned` | Offload a markdown file split by headings — each section becomes a separate entry. Server reads the file; content never enters context. Headings inside fenced code blocks are not treated as split points. |
+| `checkout_remote` | Pull full body, distill via local model, return the distillate fenced as untrusted. Body on disk is unchanged; no checkin required. Returns an error if no local model is configured, the call fails, or the distillation produces more output than the original (expansion guard) — use `checkout` directly in those cases. |
 | `pin` | Set salience to 1.0, mark entry pinned. Pinned entries survive `reap` and cleanup passes. |
 | `reap` | Delete stale entries by age and/or salience. Pinned entries are always spared. Use `dry_run: true` to preview. |
 | `forget` | Permanently delete an entry and its body file. |
-| `stats` | Session operation counts and content volume. No fake "tokens saved" claims — the server can't see your context window. |
+| `stats` | Session operation counts and content volume. No "tokens saved" claims — the server cannot see your context window. |
 
 ## MCP Resources
 
@@ -66,13 +67,13 @@ Bodies retrieved via `checkout` or `hydra://body/{id}` are wrapped in a nonce-ta
 
 The nonce is random per call and unknown to stored content, making fence breakout structurally hard. Any occurrence of the closing delimiter in the stored content is escaped before delivery.
 
-The nonce also serves as the checkout token: you must present it to `checkin`. This couples the security handshake to content retrieval — you can only check in something you actually received.
+The nonce also serves as the checkout token: you must present it to `checkin`. This couples the security handshake to content retrieval.
 
 ---
 
 ## Deduplication
 
-`offload` and `offload_path` compute a SHA-256 hash of the content before writing. If the same content is already banked under any entry, the duplicate is rejected and the existing pointer is returned. Topic/summary metadata on the existing entry is not overwritten.
+`offload` and `offload_path` compute a SHA-256 hash of the content before writing. If the same content is already banked under any entry, the duplicate is rejected and the existing pointer is returned.
 
 ---
 
@@ -80,7 +81,7 @@ The nonce also serves as the checkout token: you must present it to `checkin`. T
 
 The matrix and bodies persist in `~/.local/share/context-hydra/` across sessions. On startup, any entries left in `hot` status from a prior session are reset to `cold` and their stale nonces are cleared.
 
-Min-cold-time tracking (churn warnings after rapid checkout/checkin cycles) is intentionally session-scoped and lives in memory only — it doesn't persist, so a fresh session has no artificial cooldown on old entries.
+Min-cold-time tracking (churn warnings after rapid checkout/checkin cycles) is session-scoped and lives in memory only — it doesn't persist, so a fresh session has no artificial cooldown on old entries.
 
 ---
 
@@ -118,10 +119,8 @@ cargo build --release
 Copy the binary somewhere on your PATH:
 
 ```bash
-# macOS / Linux
 cp target/release/context-hydra /usr/local/bin/
-
-# or install directly from the repo
+# or
 cargo install --path .
 ```
 
@@ -186,14 +185,10 @@ context-hydra can use a local LLM (any OpenAI-compatible endpoint) to compress a
 ### Two operations
 
 **Compress-on-offload (`offload` with `compress: true`):**
-Content is sent to the configured local model with a summarization prompt before being stored. The body file holds the compressed version. The original is gone — use this only for content where lossy compression is acceptable (completed reasoning traces, resolved error logs, finalized design notes). The stored summary field reflects the compressed content, not the original.
+Content is sent to the configured local model with a summarization prompt before being stored. The body file holds the compressed version. The original is gone — use this only for content where lossy compression is acceptable (completed reasoning traces, resolved error logs, finalized design notes). Silently stores raw if compression is unavailable or if the model's output is longer than the input (expansion guard).
 
 **Checkout-for-remote (`checkout_remote`):**
-Pulls the full body, passes it through the local model to produce a token-efficient version, and returns the compressed output fenced as untrusted external data. The body on disk is unchanged. Use this when you need to inject stored content into a remote model's context at minimum cost — the remote model sees the distillate, not the raw body.
-
-These map to two specific use cases from kvasir's preprocessing layer:
-- **Ledger compression (#1):** `offload(compress: true)` stores a compressed ledger item. kvasir's `[c]ompress` action calls Ornith → `offload` → replaces the ledger item with a matrix pointer.
-- **Swarm handoff distillation (#3):** `checkout_remote` pulls a handoff entry and returns a distilled version sized for the receiving swarm node's context budget. The handoff payload is always the distillate, never the raw transcript.
+Pulls the full body, passes it through the local model to produce a token-efficient version, and returns the compressed output fenced as untrusted external data. The body on disk is unchanged. Returns an error if the call fails or the distillation expands the content — use `checkout` directly in those cases. Use this when you need to inject stored content into a remote model's context at minimum cost.
 
 ### Configuration
 
@@ -205,19 +200,46 @@ The config file lives in the platform data directory:
 ```toml
 [local_model]
 base_url = "http://localhost:8000/v1"
-model = "Ornith-1.0-35B-4bit"
-api_key = ""                         # leave empty if endpoint requires no auth
-compress_target_tokens = 200         # target length for compress-on-offload
-checkout_remote_target_tokens = 300  # target length for checkout_remote distillation
+compression_model = "Qwen2.5-7B-Instruct-4bit"  # see model selection below
+api_key = ""                                      # leave empty if endpoint requires no auth
+compress_target_tokens = 200         # target output length for compress-on-offload
+checkout_remote_target_tokens = 300  # target output length for checkout_remote distillation
 ```
 
-If `[local_model]` is absent or `base_url` is empty, `compress: true` is silently ignored and `checkout_remote` falls back to plain `checkout`. If the model is configured but the call fails at runtime, `checkout_remote` returns an error rather than creating a hot checkout entry — use `checkout` directly in that case. The server never fails a call solely because compression is unavailable.
+If `[local_model]` is absent or `base_url` is empty, `compress: true` is silently ignored and `checkout_remote` falls back to plain `checkout`.
+
+### Choosing a compression model
+
+The `compression_model` field is for compression and summarization only. A large reasoning model configured for general work is the wrong choice here for two reasons.
+
+**Thinking/reasoning mode must be disabled.** If thinking mode is on, the model spends the entire token budget on reasoning steps and returns empty visible content — the call silently falls back to storing raw and nothing gets compressed.
+
+How to disable thinking:
+
+- **Model variant:** Choose a non-thinking variant. Instruct variants without a "thinking" or "reasoning" suffix typically don't have it enabled by default (e.g. `Qwen2.5-7B-Instruct` rather than `Qwen3-7B`).
+- **Server-level setting:** Many local servers (LM Studio, Ollama, etc.) expose a "disable thinking" toggle or `thinking_budget` parameter. Check your server's docs.
+- **Dedicated small model:** The simplest option — a separate small model without thinking mode at all.
+
+**A smaller dedicated model is often better than a large one.** Compression is mechanical — "shorten this, keep identifiers and numbers." It does not require large-model capability, and large models are slower. Benchmarked results on four content types (error traces, reasoning chains, design notes, Rust source):
+
+| Model | RAM | Avg ratio | Avg latency | Efficiency | Notes |
+|---|---|---|---|---|---|
+| `Qwen2.5-3B-Instruct-4bit` | 2.3 GB | 2.4× | 4.3s | **1.04** | Highest efficiency; best on short prose; fails on dense code |
+| `Qwen2.5-7B-Instruct-4bit` | 4.7 GB | 2.3× | 8.6s | 0.50 | Best single-model error trace compression (4.8×); also fails on dense code |
+| `Qwen2.5-32B-Instruct-4bit` | 18.5 GB | — | — | — | Not benchmarked; expected to handle code better |
+| `Llama-3.2-3B-Instruct-4bit` | 2.0 GB | — | — | — | Not benchmarked; widely supported fallback |
+
+Efficiency = average compression ratio / RAM GB. All Qwen Instruct models have thinking mode off by default.
+
+**Code-heavy content needs a larger model.** Both Qwen 3B and 7B trigger the expansion safeguard on Rust source — the compressed output exceeds the input length, so the server stores raw. If your workload includes source files, a 30B+ model with thinking disabled is needed to get meaningful compression — or skip compression on code entirely (`offload` without `compress: true`) and use `checkout_remote` for distillation on retrieval instead.
+
+All models available via `mlx-community` on HuggingFace for Apple Silicon. Run `python3 bench_hydra.py --suggest-models` to see download paths, or `python3 bench_hydra.py --compare-models` to benchmark every model on your local endpoint.
 
 ### What the local model is not responsible for
 
-- **Relevance judgment.** context-hydra does not use the local model to decide which stored entries are relevant to the current task — that's the caller's responsibility via `search` and `recall`. Compression is mechanical (shorten this); relevance is semantic (which of these matters now).
-- **Summarizing before storing (by default).** The standard `offload` path is unchanged — no model call, no latency, no dependency. The local model is opt-in per call.
-- **Cross-entry synthesis.** `checkout_remote` operates on one entry at a time. Synthesizing across multiple entries requires the caller to compose them and send to their own model.
+- **Relevance judgment.** context-hydra does not use the local model to decide which stored entries are relevant to the current task — that's the caller's responsibility via `search` and `recall`.
+- **Standard offload path.** The default `offload` has no model call, no latency, no dependency. The local model is opt-in per call.
+- **Cross-entry synthesis.** `checkout_remote` operates on one entry at a time.
 
 ---
 
@@ -231,10 +253,6 @@ If `[local_model]` is absent or `base_url` is empty, `compress: true` is silentl
 
 ### Why the stats tool doesn't claim "tokens saved"
 
-The server is a stdio process. It has no visibility into the client's context window, the tokenizer, or transcript state. Any "tokens saved" figure would be a guess built on unverifiable assumptions. `stats` reports what the server actually knows: operation counts and content volume in bytes.
+The server is a stdio process with no visibility into the client's context window, the tokenizer, or transcript state. Any "tokens saved" figure would be a guess.
 
-The real schema overhead measurement (tool descriptions re-sent every request) requires a one-time client-side reading: token count with the server loaded vs. without. That delta is your baseline cost for having the server available.
-
-### Why nonces use 8-char hex
-
-8 hex chars = 32 bits of entropy. Sufficient for a within-session token — the nonce lives only as long as the entry is hot, and collisions within a session would require ~65k concurrent checkouts (birthday bound at 50%). Not a cryptographic guarantee; sufficient for the trust model.
+`bench_hydra.py --window-analysis` does this measurement properly: it queries the live tool schema, measures matrix row sizes from your real store, computes break-even content size per turn, and prints recommended token target settings. Measured baseline on the default tool set: ~1540 tokens schema overhead, ~23 tokens per matrix row, break-even at 3+ turns out of context for content ≥ 400 tokens.
